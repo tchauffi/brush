@@ -1,13 +1,17 @@
 use brush_dataset::splat_export;
 use brush_ui::burn_texture::BurnTexture;
 use burn_wgpu::Wgpu;
+use core::f32;
 use egui::epaint::mutex::RwLock as EguiRwLock;
 use std::{sync::Arc, time::Duration};
 
-use brush_render::gaussian_splats::Splats;
+use brush_render::{
+    camera::{focal_to_fov, fov_to_focal},
+    gaussian_splats::Splats,
+};
 use eframe::egui_wgpu::Renderer;
 use egui::{Color32, Rect};
-use glam::Vec2;
+use glam::{Quat, Vec2};
 use tokio_with_wasm::alias as tokio;
 use tracing::trace_span;
 use web_time::Instant;
@@ -72,12 +76,20 @@ impl ScenePanel {
         delta_time: web_time::Duration,
     ) {
         let mut size = ui.available_size();
-        let focal = context.camera.focal(glam::uvec2(1, 1));
-        let aspect_ratio = focal.y / focal.x;
-        if size.x / size.y > aspect_ratio {
-            size.x = size.y * aspect_ratio;
+        // Always keep some margin at the bottom
+        size.y -= 50.0;
+
+        if self.is_training {
+            let focal = context.camera.focal(glam::uvec2(1, 1));
+            let aspect_ratio = focal.y / focal.x;
+            if size.x / size.y > aspect_ratio {
+                size.x = size.y * aspect_ratio;
+            } else {
+                size.y = size.x / aspect_ratio;
+            }
         } else {
-            size.y = size.x / aspect_ratio;
+            let focal_y = fov_to_focal(context.camera.fov_y, size.y as u32) as f32;
+            context.camera.fov_x = focal_to_fov(focal_y as f64, size.x as u32);
         }
         // Round to 64 pixels. Necesarry for buffer sizes to align.
         let size = glam::uvec2(size.x.round() as u32, size.y.round() as u32);
@@ -99,10 +111,14 @@ impl ScenePanel {
             (Vec2::ZERO, Vec2::ZERO)
         };
 
-        let scrolled = ui.input(|r| r.smooth_scroll_delta).y;
+        let scrolled = ui.input(|r| {
+            r.smooth_scroll_delta.y
+                + r.multi_touch()
+                    .map(|t| (t.zoom_delta - 1.0) * context.controls.radius() * 5.0)
+                    .unwrap_or(0.0)
+        });
 
         self.dirty |= context.controls.pan_orbit_camera(
-            &mut context.camera,
             pan * 5.0,
             rotate * 5.0,
             scrolled * 0.01,
@@ -110,8 +126,13 @@ impl ScenePanel {
             delta_time.as_secs_f32(),
         );
 
-        self.dirty |= self.last_size != size;
+        let total_transform = context.model_transform * context.controls.transform;
+        context.camera.position = total_transform.translation.into();
+        context.camera.rotation = Quat::from_mat3a(&total_transform.matrix3);
+
         context.controls.dirty = false;
+
+        self.dirty |= self.last_size != size;
 
         // If this viewport is re-rendering.
         if ui.ctx().has_requested_repaint() && size.x > 0 && size.y > 0 && self.dirty {
@@ -158,7 +179,7 @@ impl ViewerPanel for ScenePanel {
         "Scene".to_owned()
     }
 
-    fn on_message(&mut self, message: &ViewerMessage, _: &mut ViewerContext) {
+    fn on_message(&mut self, message: &ViewerMessage, context: &mut ViewerContext) {
         if self.live_update {
             self.dirty = true;
         }
@@ -178,11 +199,18 @@ impl ViewerPanel for ScenePanel {
                 self.is_training = *training;
                 self.is_loading = true;
             }
-            ViewerMessage::ViewSplats { splats, frame } => {
+            ViewerMessage::ViewSplats {
+                up_axis,
+                splats,
+                frame,
+            } => {
+                context.set_up_axis(*up_axis);
+
                 if self.live_update {
                     self.view_splats.truncate(*frame);
                     log::info!("Received splat at {frame}");
                     self.view_splats.push(*splats.clone());
+                    self.frame = *frame as f32 - 0.5;
                 }
             }
             ViewerMessage::TrainStep {
@@ -251,22 +279,31 @@ For bigger training runs consider using the native app."#,
 
             self.draw_splats(ui, context, &splats, delta_time);
 
+            if self.is_loading {
+                ui.horizontal(|ui| {
+                    ui.label("Loading... Please wait.");
+                    ui.spinner();
+                });
+            }
+
             if self.view_splats.len() > 1 {
                 self.dirty = true;
 
-                let label = if self.paused {
-                    "⏸ paused"
-                } else {
-                    "⏵ playing"
-                };
+                if !self.is_loading {
+                    let label = if self.paused {
+                        "⏸ paused"
+                    } else {
+                        "⏵ playing"
+                    };
 
-                if ui.selectable_label(!self.paused, label).clicked() {
-                    self.paused = !self.paused;
-                }
+                    if ui.selectable_label(!self.paused, label).clicked() {
+                        self.paused = !self.paused;
+                    }
 
-                if !self.paused {
-                    self.frame += delta_time.as_secs_f32();
-                    self.dirty = true;
+                    if !self.paused {
+                        self.frame += delta_time.as_secs_f32();
+                        self.dirty = true;
+                    }
                 }
             }
 

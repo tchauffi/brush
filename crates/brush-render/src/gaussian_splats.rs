@@ -175,6 +175,10 @@ impl<B: Backend> Splats<B> {
         sh_coeffs: Tensor<B, 3>,
         raw_opacity: Tensor<B, 1>,
     ) -> Self {
+        assert_eq!(means.dims()[1], 3);
+        assert_eq!(rotation.dims()[1], 4);
+        assert_eq!(log_scales.dims()[1], 3);
+
         let num_points = means.shape().dims[0];
         let device = means.device();
 
@@ -213,17 +217,13 @@ impl<B: Backend> Splats<B> {
         img_size: glam::UVec2,
         render_u32_buffer: bool,
     ) -> (Tensor<B, 3>, crate::RenderAux<B>) {
-        // TODO: Remove for forward only.
-        let rotations = self.rotation.val();
-        let norm_rot = rotations.clone() / Tensor::sum_dim(rotations.powi_scalar(2), 1).sqrt();
-
         let (img, aux) = B::render_splats(
             camera,
             img_size,
             self.means.val().into_primitive().tensor(),
             self.xys_dummy.clone().into_primitive().tensor(),
             self.log_scales.val().into_primitive().tensor(),
-            norm_rot.into_primitive().tensor(),
+            self.rotation.val().into_primitive().tensor(),
             self.sh_coeffs.val().into_primitive().tensor(),
             self.raw_opacity.val().into_primitive().tensor(),
             render_u32_buffer,
@@ -253,8 +253,8 @@ impl<B: Backend> Splats<B> {
     pub fn from_safetensors(tensors: &SafeTensors, device: &B::Device) -> anyhow::Result<Self> {
         Ok(Self::from_tensor_data(
             safetensor_to_burn::<B, 2>(tensors.tensor("means")?, device),
-            safetensor_to_burn::<B, 2>(tensors.tensor("scales")?, device),
             safetensor_to_burn::<B, 2>(tensors.tensor("quats")?, device),
+            safetensor_to_burn::<B, 2>(tensors.tensor("scales")?, device),
             safetensor_to_burn::<B, 3>(tensors.tensor("coeffs")?, device),
             safetensor_to_burn::<B, 1>(tensors.tensor("opacities")?, device),
         ))

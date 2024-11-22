@@ -1,33 +1,42 @@
-use brush_render::camera::Camera;
-use glam::{Mat3, Quat, Vec2, Vec3};
+use core::f32;
+
+use glam::{Affine3A, Mat3A, Vec2, Vec3A};
 
 pub struct OrbitControls {
-    pub focus: Vec3,
+    pub transform: Affine3A,
+
+    pub focus: Vec3A,
     pub dirty: bool,
+
     pan_momentum: Vec2,
     rotate_momentum: Vec2,
 }
 
 impl OrbitControls {
-    pub fn new() -> Self {
+    pub fn new(transform: Affine3A) -> Self {
         Self {
-            focus: Vec3::ZERO,
+            transform,
+            focus: Vec3A::ZERO,
             pan_momentum: Vec2::ZERO,
             rotate_momentum: Vec2::ZERO,
             dirty: false,
         }
     }
 
+    pub fn radius(&self) -> f32 {
+        (self.transform.translation - self.focus).length()
+    }
+
     pub fn pan_orbit_camera(
         &mut self,
-        camera: &mut Camera,
         pan: Vec2,
         rotate: Vec2,
         scroll: f32,
         window: Vec2,
         delta_time: f32,
     ) -> bool {
-        let mut radius = (camera.position - self.focus).length();
+        let mut rotation = self.transform.matrix3;
+        let mut radius = (self.transform.translation - self.focus).length();
         // Adjust momentum with the new input
         self.pan_momentum += pan;
         self.rotate_momentum += rotate;
@@ -43,14 +52,14 @@ impl OrbitControls {
 
         let delta_x = rotate_velocity.x * std::f32::consts::PI * 2.0 / window.x;
         let delta_y = rotate_velocity.y * std::f32::consts::PI / window.y;
-        let yaw = Quat::from_rotation_y(delta_x);
-        let pitch = Quat::from_rotation_x(-delta_y);
-        camera.rotation = yaw * camera.rotation * pitch;
+        let yaw = Mat3A::from_rotation_y(delta_x);
+        let pitch = Mat3A::from_rotation_x(-delta_y);
+        rotation = yaw * rotation * pitch;
 
         let scaled_pan = pan_velocity * Vec2::new(1.0 / window.x, 1.0 / window.y);
 
-        let right = camera.rotation * Vec3::X * -scaled_pan.x;
-        let up = camera.rotation * Vec3::Y * -scaled_pan.y;
+        let right = rotation * Vec3A::X * -scaled_pan.x;
+        let up = rotation * Vec3A::Y * -scaled_pan.y;
 
         let translation = (right + up) * radius;
         self.focus += translation;
@@ -67,8 +76,8 @@ impl OrbitControls {
             radius = radius * 0.5 + max * 0.5;
         }
 
-        let rot_matrix = Mat3::from_quat(camera.rotation);
-        camera.position = self.focus + rot_matrix.mul_vec3(Vec3::new(0.0, 0.0, -radius));
+        self.transform.translation = self.focus + rotation * Vec3A::new(0.0, 0.0, -radius);
+        self.transform.matrix3 = rotation;
 
         scroll.abs() > 0.0
             || pan.length_squared() > 0.0
