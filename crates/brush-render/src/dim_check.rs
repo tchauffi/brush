@@ -1,5 +1,5 @@
-use burn_jit::{JitElement, JitRuntime};
-use burn_wgpu::JitTensor;
+use burn_cubecl::CubeRuntime;
+use burn_wgpu::CubeTensor;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
@@ -9,12 +9,12 @@ pub(crate) enum DimBound {
     Matching(&'static str),
 }
 
-pub(crate) struct DimCheck<'a, R: JitRuntime> {
+pub(crate) struct DimCheck<'a, R: CubeRuntime> {
     bound: HashMap<&'a str, usize>,
     device: Option<R::Device>,
 }
 
-impl<R: JitRuntime> DimCheck<'_, R> {
+impl<R: CubeRuntime> DimCheck<'_, R> {
     pub fn new() -> Self {
         DimCheck {
             bound: HashMap::new(),
@@ -22,25 +22,38 @@ impl<R: JitRuntime> DimCheck<'_, R> {
         }
     }
 
-    pub fn check_dims<E: JitElement>(
-        mut self,
-        tensor: &JitTensor<R, E>,
-        bounds: &[DimBound],
-    ) -> Self {
+    pub fn check_dims(mut self, name: &str, tensor: &CubeTensor<R>, bounds: &[DimBound]) -> Self {
         let dims = &tensor.shape.dims;
 
         match self.device.as_ref() {
             None => self.device = Some(tensor.device.clone()),
-            Some(d) => assert_eq!(d, &tensor.device),
+            Some(d) => assert_eq!(
+                d, &tensor.device,
+                "Tensors {name} should be on same device to start with."
+            ),
         }
+        assert!(
+            tensor.is_contiguous(),
+            "Tensor {name} must be contiguous {:?} {:?}",
+            tensor.strides,
+            tensor.shape
+        );
 
         for (cur_dim, bound) in dims.iter().zip(bounds) {
             match bound {
-                DimBound::Exact(dim) => assert_eq!(cur_dim, dim),
+                DimBound::Exact(dim) => {
+                    assert_eq!(
+                        cur_dim, dim,
+                        "Dimension mismatch in {name} :: {cur_dim} != {dim}"
+                    );
+                }
                 DimBound::Any => (),
                 DimBound::Matching(id) => {
                     let dim = self.bound.entry(id).or_insert(*cur_dim);
-                    assert_eq!(cur_dim, dim);
+                    assert_eq!(
+                        cur_dim, dim,
+                        "Dimension mismatch in {name} :: {cur_dim} != {dim}"
+                    );
                 }
             }
         }
@@ -50,27 +63,27 @@ impl<R: JitRuntime> DimCheck<'_, R> {
 
 impl From<usize> for DimBound {
     fn from(value: usize) -> Self {
-        DimBound::Exact(value)
+        Self::Exact(value)
     }
 }
 
 impl From<u32> for DimBound {
     fn from(value: u32) -> Self {
-        DimBound::Exact(value as usize)
+        Self::Exact(value as usize)
     }
 }
 
 impl From<i32> for DimBound {
     fn from(value: i32) -> Self {
-        DimBound::Exact(value as usize)
+        Self::Exact(value as usize)
     }
 }
 
 impl From<&'static str> for DimBound {
     fn from(value: &'static str) -> Self {
         match value {
-            "*" => DimBound::Any,
-            _ => DimBound::Matching(value),
+            "*" => Self::Any,
+            _ => Self::Matching(value),
         }
     }
 }

@@ -1,6 +1,12 @@
+#![recursion_limit = "256"]
+
+pub mod config;
 pub mod eval;
-pub mod ssim;
+pub mod msg;
 pub mod train;
 
-pub mod image;
-pub mod scene;
+mod adam_scaled;
+mod multinomial;
+mod quat_vec;
+mod ssim;
+mod stats;

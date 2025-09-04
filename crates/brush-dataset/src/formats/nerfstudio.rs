@@ -1,36 +1,37 @@
-use super::DatasetZip;
-use super::LoadDatasetArgs;
-use crate::splat_import::load_splat_from_ply;
-use crate::splat_import::SplatMessage;
-use crate::stream_fut_parallel;
-use crate::{clamp_img_to_max_size, DataStream, Dataset};
-use anyhow::Context;
-use anyhow::Result;
-use async_fn_stream::try_fn_stream;
-use brush_render::camera::{focal_to_fov, fov_to_focal, Camera};
-use brush_render::Backend;
-use brush_train::scene::SceneView;
-use std::future::Future;
-use std::io::Cursor;
-use std::path::PathBuf;
+use super::FormatError;
+use super::find_mask_path;
+use crate::{
+    Dataset,
+    config::LoadDataseConfig,
+    scene::{LoadImage, SceneView},
+};
+use brush_render::camera::fov_to_focal;
+use brush_render::camera::{Camera, focal_to_fov};
+use brush_serde::{SplatMessage, load_splat_from_ply};
+use brush_vfs::BrushVfs;
+use burn::backend::wgpu::WgpuDevice;
+use std::path::Path;
 use std::sync::Arc;
-use tokio_stream::StreamExt;
+use tokio::io::AsyncReadExt;
 
 #[derive(serde::Deserialize, Clone)]
 #[allow(unused)] // not reading camera distortions yet.
 struct JsonScene {
-    // Simple synthetic nerf camera model.
+    // Horizontal FOV.
     camera_angle_x: Option<f64>,
-    // Not really used atm.
-    camera_model: Option<String>,
-
-    // Nerfstudio doesn't mention this in their format? But fine to include really.
-    ply_file_path: Option<String>,
+    // Vertical FOV.
+    camera_angle_y: Option<f64>,
 
     /// Focal length x
     fl_x: Option<f64>,
     /// Focal length y
     fl_y: Option<f64>,
+
+    // Not really used atm.
+    camera_model: Option<String>,
+    // Nerfstudio doesn't mention this in their format? But fine to include really.
+    ply_file_path: Option<String>,
+
     /// Principal point x
     cx: Option<f64>,
     /// Principal point y
@@ -40,17 +41,17 @@ struct JsonScene {
     /// Image height
     h: Option<f64>,
 
-    /// First radial distortion parameter used by [OPENCV, OPENCV_FISHEYE]
+    /// First radial distortion parameter used by [`OPENCV`, `OPENCV_FISHEYE`]
     k1: Option<f64>,
-    /// Second radial distortion parameter used by [OPENCV, OPENCV_FISHEYE]
+    /// Second radial distortion parameter used by [`OPENCV`, `OPENCV_FISHEYE`]
     k2: Option<f64>,
-    /// Third radial distortion parameter used by [OPENCV_FISHEYE]
+    /// Third radial distortion parameter used by [`OPENCV_FISHEYE`]
     k3: Option<f64>,
-    /// Fourth radial distortion parameter used by [OPENCV_FISHEYE]
+    /// Fourth radial distortion parameter used by [`OPENCV_FISHEYE`]
     k4: Option<f64>,
-    /// First tangential distortion parameter used by [OPENCV]
+    /// First tangential distortion parameter used by [`OPENCV`]
     p1: Option<f64>,
-    /// Second tangential distortion parameter used by [OPENCV]
+    /// Second tangential distortion parameter used by [`OPENCV`]
     p2: Option<f64>,
 
     frames: Vec<FrameData>,
@@ -59,12 +60,16 @@ struct JsonScene {
 #[derive(serde::Deserialize, Clone)]
 #[allow(unused)] // not reading camera distortions yet.
 struct FrameData {
-    // Nerfstudio format
-    //
+    // Horizontal FOV.
+    camera_angle_x: Option<f64>,
+    // Vertical FOV.
+    camera_angle_y: Option<f64>,
+
     /// Focal length x
     fl_x: Option<f64>,
     /// Focal length y
     fl_y: Option<f64>,
+
     /// Principal point x
     cx: Option<f64>,
     /// Principal point y
@@ -74,211 +79,216 @@ struct FrameData {
     /// Image height. Should be an integer but read as float, fine to truncate.
     h: Option<f64>,
 
-    // TODO: These are unused currently.
-    /// First radial distortion parameter used by [OPENCV, OPENCV_FISHEYE]
+    // Nb: These are unused currently until we can optimize distorted cameras.
+    /// First radial distortion parameter used by [`OPENCV`, `OPENCV_FISHEYE`]
     k1: Option<f64>,
-    /// Second radial distortion parameter used by [OPENCV, OPENCV_FISHEYE]
+    /// Second radial distortion parameter used by [`OPENCV`, `OPENCV_FISHEYE`]
     k2: Option<f64>,
-    /// Third radial distortion parameter used by [OPENCV_FISHEYE]
+    /// Third radial distortion parameter used by [`OPENCV_FISHEYE`]
     k3: Option<f64>,
-    /// Fourth radial distortion parameter used by [OPENCV_FISHEYE]
+    /// Fourth radial distortion parameter used by [`OPENCV_FISHEYE`]
     k4: Option<f64>,
-    /// First tangential distortion parameter used by [OPENCV]
+    /// First tangential distortion parameter used by [`OPENCV`]
     p1: Option<f64>,
-    /// Second tangential distortion parameter used by [OPENCV]
+    /// Second tangential distortion parameter used by [`OPENCV`]
     p2: Option<f64>,
 
     transform_matrix: Vec<Vec<f32>>,
     file_path: String,
 }
 
-fn read_transforms_file(
+async fn read_transforms_file(
     scene: JsonScene,
-    transforms_path: PathBuf,
-    archive: DatasetZip,
-    load_args: &LoadDatasetArgs,
-) -> Result<Vec<impl Future<Output = anyhow::Result<SceneView>>>> {
-    let iter = scene
+    transforms_path: &Path,
+    vfs: Arc<BrushVfs>,
+    load_args: &LoadDataseConfig,
+) -> Result<Vec<SceneView>, FormatError> {
+    let mut results = vec![];
+    for frame in scene
         .frames
-        .into_iter()
+        .iter()
         .take(load_args.max_frames.unwrap_or(usize::MAX))
-        .map(move |frame| {
-            let mut archive = archive.clone();
-            let load_args = load_args.clone();
-            let transforms_path = transforms_path.clone();
+        .step_by(load_args.subsample_frames.unwrap_or(1) as usize)
+    {
+        // NeRF 'transform_matrix' is a camera-to-world transform
+        let transform_matrix: Vec<f32> = frame.transform_matrix.iter().flatten().copied().collect();
+        let mut transform = glam::Mat4::from_cols_slice(&transform_matrix).transpose();
+        // Swap basis to match camera format and reconstrunstion ply (if included).
+        transform.y_axis *= -1.0;
+        transform.z_axis *= -1.0;
+        let (_, rotation, translation) = transform.to_scale_rotation_translation();
 
-            async move {
-                // NeRF 'transform_matrix' is a camera-to-world transform
-                let transform_matrix: Vec<f32> =
-                    frame.transform_matrix.iter().flatten().copied().collect();
-                let mut transform = glam::Mat4::from_cols_slice(&transform_matrix).transpose();
-                // Swap basis to match camera format and reconstrunstion ply (if included).
-                transform.y_axis *= -1.0;
-                transform.z_axis *= -1.0;
-                let (_, rotation, translation) = transform.to_scale_rotation_translation();
+        let mut path = transforms_path
+            .parent()
+            .expect("Transforms path must be a filename")
+            .join(&frame.file_path);
 
-                // Read the imageat the specified path, fallback to default .png extension.
-                let mut path = transforms_path
-                    .clone()
-                    .parent()
-                    .unwrap()
-                    .join(&frame.file_path);
-                if path.extension().is_none() {
-                    path = path.with_extension("png");
-                }
-                let img_buffer = archive.read_bytes_at_path(&path)?;
+        // Assume png's by default if no extension is specified.
+        if path.extension().is_none() {
+            path = path.with_extension("png");
+        }
+        let mask_path = find_mask_path(&vfs, &path);
 
-                let comp_span = tracing::trace_span!("Decompress image").entered();
-                drop(comp_span);
+        let image = LoadImage::new(vfs.clone(), &path, mask_path, load_args.max_resolution).await;
 
-                // Create a cursor from the buffer
-                let mut image = tracing::trace_span!("Decode image")
-                    .in_scope(|| image::load_from_memory(&img_buffer))?;
-
-                let w = frame.w.or(scene.w).unwrap_or(image.width() as f64) as u32;
-                let h = frame.h.or(scene.h).unwrap_or(image.height() as f64) as u32;
-
-                if let Some(max_resolution) = load_args.max_resolution {
-                    image = clamp_img_to_max_size(image, max_resolution);
-                }
-
-                let focal_x = frame
-                    .fl_x
-                    .or(scene.fl_x)
-                    .or(scene.camera_angle_x.map(|fx| fov_to_focal(fx, w)))
-                    .context("Must have a focal length of some kind.")?;
-
-                // Read fov y or derive it from the input.
-                let focal_y = frame.fl_y.or(scene.fl_y).unwrap_or(focal_x);
-
-                let fovx = focal_to_fov(focal_x, w);
-                let fovy = focal_to_fov(focal_y, h);
-
-                let cx = frame.cx.or(scene.cx).unwrap_or(w as f64 / 2.0);
-                let cy = frame.cy.or(scene.cy).unwrap_or(h as f64 / 2.0);
-
-                let cuv = glam::vec2((cx / w as f64) as f32, (cy / h as f64) as f32);
-
-                let view = SceneView {
-                    name: frame.file_path.to_owned(),
-                    camera: Camera::new(translation, rotation, fovx, fovy, cuv),
-                    image: Arc::new(image),
-                };
-                anyhow::Result::<SceneView>::Ok(view)
+        let image = match image {
+            Ok(image) => image,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::warn!("Image not found: {path:?}");
+                continue;
             }
-        });
-
-    Ok(iter.collect())
-}
-
-pub fn read_dataset<B: Backend>(
-    mut archive: DatasetZip,
-    load_args: &LoadDatasetArgs,
-    device: &B::Device,
-) -> Result<(DataStream<SplatMessage<B>>, DataStream<Dataset>)> {
-    log::info!("Loading nerfstudio dataset");
-
-    let transforms_path = archive.find_with_extension(".json", "_train")?;
-    let train_scene: JsonScene = serde_json::from_reader(archive.file_at_path(&transforms_path)?)?;
-    let mut train_handles = read_transforms_file(
-        train_scene.clone(),
-        transforms_path.clone(),
-        archive.clone(),
-        load_args,
-    )?;
-
-    if let Some(subsample) = load_args.subsample_frames {
-        train_handles = train_handles
-            .into_iter()
-            .step_by(subsample as usize)
-            .collect();
-    }
-
-    let load_args_clone = load_args.clone();
-    let mut archive_clone = archive.clone();
-
-    let transforms_path_clone = transforms_path.clone();
-
-    let dataset_stream = try_fn_stream(|emitter| async move {
-        let mut train_views = vec![];
-        let mut eval_views = vec![];
-
-        let eval_trans_path = archive_clone.find_with_extension(".json", "_val")?;
-
-        // If a seperate eval file is specified, read it.
-        let val_stream = if eval_trans_path != transforms_path_clone {
-            let val_scene = serde_json::from_reader(archive_clone.file_at_path(&eval_trans_path)?)?;
-            read_transforms_file(val_scene, eval_trans_path, archive_clone, &load_args_clone).ok()
-        } else {
-            None
+            Err(e) => Err(e)?,
         };
 
-        log::info!("Loading transforms_test.json");
-        // Not entirely sure yet if we want to report stats on both test
-        // and eval, atm this skips "transforms_test.json" even if it's there.
+        let w = frame.w.or(scene.w).unwrap_or(image.width() as f64) as u32;
+        let h = frame.h.or(scene.h).unwrap_or(image.height() as f64) as u32;
 
-        let train_handles = stream_fut_parallel(train_handles);
-        let mut train_handles = std::pin::pin!(train_handles);
+        let fovx = frame
+            .camera_angle_x
+            .or(frame.fl_x.map(|fx| focal_to_fov(fx, w)))
+            .or(scene.camera_angle_x)
+            .or(scene.fl_x.map(|fx| focal_to_fov(fx, w)));
 
-        let mut i = 0;
-        while let Some(view) = train_handles.next().await {
-            if let Some(eval_period) = load_args_clone.eval_split_every {
-                // Include extra eval images only when the dataset doesn't have them.
-                if i % eval_period == 0 && val_stream.is_some() {
-                    eval_views.push(view?);
-                } else {
-                    train_views.push(view?);
-                }
+        let fovy = frame
+            .camera_angle_y
+            .or(frame.fl_y.map(|fy| focal_to_fov(fy, h)))
+            .or(scene.camera_angle_y)
+            .or(scene.fl_y.map(|fy| focal_to_fov(fy, h)));
+
+        let (fovx, fovy) = match (fovx, fovy) {
+            (None, None) => Err(FormatError::InvalidCamera(
+                "Must have some kind of focal length".to_owned(),
+            ))?,
+            (None, Some(fovy)) => {
+                let fovx = focal_to_fov(fov_to_focal(fovy, h), w);
+                (fovx, fovy)
+            }
+            (Some(fovx), None) => {
+                let fovy = focal_to_fov(fov_to_focal(fovx, w), h);
+                (fovx, fovy)
+            }
+            (Some(fovx), Some(fovy)) => (fovx, fovy),
+        };
+
+        let cx = frame.cx.or(scene.cx).unwrap_or(w as f64 / 2.0);
+        let cy = frame.cy.or(scene.cy).unwrap_or(h as f64 / 2.0);
+
+        let cuv = glam::vec2((cx / w as f64) as f32, (cy / h as f64) as f32);
+
+        let view = SceneView {
+            image,
+            camera: Camera::new(translation, rotation, fovx, fovy, cuv),
+        };
+        results.push(view);
+    }
+    Ok(results)
+}
+
+pub async fn read_dataset(
+    vfs: Arc<BrushVfs>,
+    load_args: &LoadDataseConfig,
+    device: &WgpuDevice,
+) -> Option<Result<(Option<SplatMessage>, Dataset), FormatError>> {
+    log::info!("Loading nerfstudio dataset");
+
+    let json_files: Vec<_> = vfs.files_with_extension("json").collect();
+
+    let transforms_path = if json_files.len() == 1 {
+        json_files.first().cloned()?
+    } else {
+        // If there's multiple options, only pick files which are either exactly
+        // transforms.json or end with transforms_train.json (a la transforms_train.json)
+        vfs.files_ending_in("transforms.json")
+            .next()
+            .or_else(|| vfs.files_ending_in("transforms_train.json").next())?
+    };
+
+    Some(read_dataset_inner(vfs, load_args, device, json_files, transforms_path).await)
+}
+
+async fn read_dataset_inner(
+    vfs: Arc<BrushVfs>,
+    load_args: &LoadDataseConfig,
+    device: &WgpuDevice,
+    json_files: Vec<std::path::PathBuf>,
+    transforms_path: std::path::PathBuf,
+) -> Result<(Option<SplatMessage>, Dataset), FormatError> {
+    let mut buf = String::new();
+    vfs.reader_at_path(&transforms_path)
+        .await?
+        .read_to_string(&mut buf)
+        .await?;
+    let train_scene: JsonScene = serde_json::from_str(&buf)?;
+    let train_handles = read_transforms_file(
+        train_scene.clone(),
+        &transforms_path,
+        vfs.clone(),
+        load_args,
+    )
+    .await?;
+
+    // Use transforms_val as eval, or _test if no _val is present. (Brush doesn't really have any notion of a test set).
+    let eval_trans_path = json_files
+        .iter()
+        .find(|x| x.ends_with("transforms_val.json"))
+        .or_else(|| {
+            json_files
+                .iter()
+                .find(|x| x.ends_with("transforms_test.json"))
+        });
+    // If a separate eval file is specified, read it.
+    let val_views = if let Some(eval_trans_path) = eval_trans_path {
+        let mut json_str = String::new();
+        vfs.reader_at_path(eval_trans_path)
+            .await?
+            .read_to_string(&mut json_str)
+            .await?;
+        let val_scene = serde_json::from_str(&json_str)?;
+        Some(read_transforms_file(val_scene, eval_trans_path, vfs.clone(), load_args).await?)
+    } else {
+        None
+    };
+
+    let mut train_views = vec![];
+    let mut eval_views = vec![];
+    for (i, view) in train_handles.into_iter().enumerate() {
+        if let Some(eval_period) = load_args.eval_split_every {
+            // Include extra eval images only when the dataset doesn't have them.
+            if i % eval_period == 0 && val_views.is_none() {
+                eval_views.push(view);
             } else {
-                train_views.push(view?);
+                train_views.push(view);
             }
-
-            emitter
-                .emit(Dataset::from_views(train_views.clone(), eval_views.clone()))
-                .await;
-
-            i += 1;
+        } else {
+            train_views.push(view);
         }
+    }
 
-        if let Some(val_stream) = val_stream {
-            let val_handles = stream_fut_parallel(val_stream);
-            let mut val_handles = std::pin::pin!(val_handles);
-            while let Some(view) = val_handles.next().await {
-                eval_views.push(view?);
-                emitter
-                    .emit(Dataset::from_views(train_views.clone(), eval_views.clone()))
-                    .await;
-            }
-        }
+    if let Some(val_views) = val_views {
+        eval_views.extend(val_views);
+    }
 
-        Ok(())
-    });
+    let dataset = Dataset::from_views(train_views, eval_views);
 
     let device = device.clone();
     let load_args = load_args.clone();
 
-    let splat_stream = try_fn_stream(|emitter| async move {
-        if let Some(init) = train_scene.ply_file_path {
-            let init_path = transforms_path.parent().unwrap().join(init);
-            let ply_data = archive.read_bytes_at_path(&init_path);
+    let mut init_splat = None;
 
-            if let Ok(ply_data) = ply_data {
-                let splat_stream = load_splat_from_ply(
-                    Cursor::new(ply_data),
-                    load_args.subsample_points,
-                    device.clone(),
-                );
+    if let Some(init_path) = train_scene.ply_file_path {
+        let init_path = transforms_path
+            .parent()
+            .expect("Transforms path must be a filename")
+            .join(init_path);
 
-                let mut splat_stream = std::pin::pin!(splat_stream);
+        let ply_data = vfs.reader_at_path(&init_path).await;
 
-                // If sucesfully extracted, sent this splat as an initial splat.
-                while let Some(Ok(splat)) = splat_stream.next().await {
-                    emitter.emit(splat).await;
-                }
-            }
+        if let Ok(ply_data) = ply_data {
+            init_splat = Some(
+                load_splat_from_ply(ply_data, load_args.subsample_points, device.clone()).await?,
+            );
         }
-        Ok(())
-    });
+    }
 
-    Ok((Box::pin(splat_stream), Box::pin(dataset_stream)))
+    Ok((init_splat, dataset))
 }

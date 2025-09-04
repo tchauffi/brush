@@ -16,12 +16,16 @@ targets = [
     { triple = "x86_64-pc-windows-msvc" },
     { triple = "x86_64-unknown-linux-gnu" },
     { triple = "x86_64-unknown-linux-musl" },
+    { triple = "aarch64-linux-android" },
 ]
 all-features = true
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # Paste is unmaintained, used by Cube and rerun, wait for them to upgrade.
+    "RUSTSEC-2024-0436",
+]
 
 [bans]
 multiple-versions = "deny"
@@ -32,54 +36,74 @@ deny = [
 
 skip = [
     # common small deps.
-    { name = "bit-set" },
-    { name = "bit-vec" },
     { name = "bitflags" },
-    { name = 'cfg_aliases' },
-    { name = 'syn' },
     { name = 'itertools' },
+    { name = 'getrandom' },
+    { name = 'syn' },
+    { name = 'strum_macros' },
+    { name = 'strum' },
+    { name = 'gemm-common' },
 
-    # Rfd problematic deps.
-    { name = 'futures-lite' },      # Duplicate in rfd.
-    { name = 'fastrand' },          # Duplicate in rfd.
-    { name = 'event-listener' },    # Duplicate in rfd.
-    { name = 'async-io' },          # Duplicate in rfd.
-    { name = 'async-lock' },        # Duplicate in rfd.
-    { name = 'async-fs' },          # Duplicate in rfd.
-    { name = 'polling' },           # Duplicate in rfd.
-    { name = 'memoffset' },         # Duplicate in rfd.
-    { name = 'linux-raw-sys' },     # Duplicate in rfd.
-    { name = 'toml_edit' },         # Duplicate in rfd.
-    { name = 'rustix' },            # Duplicate in rfd.
-    { name = 'raw-window-handle' }, # Old version from rfd.
+    # Until everyone is on 0.9
+    { name = "rand" },
+    { name = "rand_core" },
+    { name = "rand_chacha" },
 
-    { name = 'async-process' }, # RFD & async-std
-    { name = 'async-channel' }, # async-std
+    { name = "yoke-derive" },
+    { name = "yoke" },
+    { name = "sysctl" },
 
-    # Custom ply fork.
-    { name = "ply-rs" },         # Custom fork & rerun version.
-    { name = 'peg' },            # Custom ply fork & rerun version.
-    { name = 'peg-macros' },     # Custom ply fork & rerun version.
-    { name = 'peg-runtime' },    # Custom ply fork & rerun version.
-    { name = 'cargo_metadata' }, # Duplicate from custom ply + rerun
+    #
+    { name = 'thiserror' },
+    { name = 'thiserror-impl' },
+    { name = 'unicode-width' },
 
-    # Rerun
-    { name = 'fixed' }, # Old version iin rerun
+    { name = 'cargo_metadata' }, # Duplicate from ply_rs + rerun
 
     # Other
-    { name = "core-foundation" }, # Egui has two?
-    { name = 'bincode' },         # Burn uses rc2, puffin 1.3.1
-    # { name = "web-time" },            # Old version from egui & rerun.
+    { name = "core-foundation" },     # Egui has two?
     { name = 'windows_x86_64_msvc' }, # Old version from winit.
     { name = 'windows_x86_64_gnu' },  # Old version from winit.
     { name = 'windows-targets' },     # Old version from winit.
     { name = 'windows-sys' },         # Old version from winit.
-    { name = 'windows-core' },        # Wgpu & rerun
 
-    { name = 'windows' },   # Wgpu & kiddo
+    { name = 'windows-core' },      # Wgpu & rerun
+    { name = 'windows-strings' },   # Wgpu & rerun
+    { name = 'windows-result' },    # Wgpu & rerun
+    { name = 'windows-interface' }, # Wgpu & rerun
+    { name = 'windows-implement' }, # Wgpu & rerun
+
+    { name = 'rustix' },        # Winit & clap
+    { name = 'linux-raw-sys' }, # Winit & clap
+
+    { name = 'objc2-foundation' }, # eframe & rfd
+    { name = 'block2' },           # eframe & rfd
+    { name = 'objc2-app-kit' },    # eframe & rfd
+    { name = 'objc2' },            # eframe & rfd
+    { name = 'windows' },          # Wgpu & kiddo
     { name = 'hashbrown' },
+    { name = 'zip' },
+    { name = 'colored' },
+    { name = "rustc-hash" },
 
-    # { name = 'miniz_oxide' },         # Rerun & burn
+    { name = 'ndk-sys' }, # Needed on Android.
+
+    { name = "dyn-stack" }, # Burn-import weirdness.
+    { name = "gemm" },      # Burn-import weirdness.
+    { name = "gemm-f16" },  # Burn-import weirdness.
+    { name = "gemm-f32" },  # Burn-import weirdness.
+    { name = "gemm-f64" },  # Burn-import weirdness.
+    { name = "gemm-c32" },  # Burn-import weirdness.
+    { name = "gemm-c64" },  # Burn-import weirdness.
+    { name = "raw-cpuid" }, # Burn-import weirdness.
+    { name = "pulp" },      # Burn-import weirdness.
+
+    # Older versions in rerun.
+    { name = "toml" },
+    { name = "toml_datetime" },
+    { name = "serde_spanned" },
+    { name = "socket2" },
+    { name = "prettyplease" },
 ]
 
 [licenses]
@@ -94,25 +118,24 @@ allow = [
     "BSL-1.0",                        # https://tldrlegal.com/license/boost-software-license-1.0-explained
     "CC0-1.0",                        # https://creativecommons.org/publicdomain/zero/1.0/
     "ISC",                            # https://www.tldrlegal.com/license/isc-license
-    "LicenseRef-UFL-1.0",             # no official SPDX, see https://github.com/emilk/egui/issues/2321
     "MIT",                            # https://tldrlegal.com/license/mit-license
     "MPL-2.0",                        # https://www.mozilla.org/en-US/MPL/2.0/FAQ/ - see Q11. Used by webpki-roots on Linux.
-    "OFL-1.1",                        # https://spdx.org/licenses/OFL-1.1.html
-    "Unicode-DFS-2016",               # https://spdx.org/licenses/Unicode-DFS-2016.html
     "Zlib",                           # https://tldrlegal.com/license/zlib-libpng-license-(zlib)
     "Unlicense",                      # https://www.tldrlegal.com/license/unlicense
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "bzip2-1.0.6",
 ]
-exceptions = []
-
-[[licenses.clarify]]
-name = "webpki"
-expression = "ISC"
-license-files = [{ path = "LICENSE", hash = 0x001c7e6c }]
 
 [[licenses.clarify]]
 name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[[licenses.clarify]]
+name = "epaint_default_fonts"
+expression = "(MIT OR Apache-2.0)"
+license-files = []
 
 [sources]
 unknown-registry = "deny"

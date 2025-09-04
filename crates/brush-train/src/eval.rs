@@ -1,77 +1,69 @@
-use brush_render::RenderAux;
-use brush_render::{gaussian_splats::Splats, Backend};
-use burn::tensor::{ElementConversion, Tensor};
+use anyhow::Result;
+use brush_dataset::scene::{sample_to_tensor, view_to_sample_image};
+use brush_render::SplatForward;
+use brush_render::camera::Camera;
+use brush_render::gaussian_splats::Splats;
+use brush_render::render_aux::RenderAux;
+use burn::prelude::Backend;
+use burn::tensor::{Tensor, TensorPrimitive, s};
+use glam::Vec3;
 use image::DynamicImage;
-use rand::seq::IteratorRandom;
 
-use crate::image::image_to_tensor;
-use crate::scene::{Scene, SceneView};
 use crate::ssim::Ssim;
 
-#[derive(Clone)]
-pub struct EvalView<B: Backend> {
-    pub view: SceneView,
+pub struct EvalSample<B: Backend> {
+    pub gt_img: DynamicImage,
     pub rendered: Tensor<B, 3>,
-    // TODO: Maybe these are better kept as tensors too,
-    // but would complicate displaying things in the stats panel a bit.
-    pub psnr: f32,
-    pub ssim: f32,
+    pub psnr: Tensor<B, 1>,
+    pub ssim: Tensor<B, 1>,
     pub aux: RenderAux<B>,
 }
 
-#[derive(Clone)]
-pub struct EvalStats<B: Backend> {
-    pub samples: Vec<EvalView<B>>,
-}
-
-pub async fn eval_stats<B: Backend>(
-    splats: Splats<B>,
-    eval_scene: &Scene,
-    num_frames: Option<usize>,
-    rng: &mut impl rand::Rng,
+pub fn eval_stats<B: Backend + SplatForward<B>>(
+    splats: &Splats<B>,
+    gt_cam: &Camera,
+    gt_img: DynamicImage,
+    alpha_is_mask: bool,
     device: &B::Device,
-) -> EvalStats<B> {
-    let indices = if let Some(num) = num_frames {
-        (0..eval_scene.views.len()).choose_multiple(rng, num)
-    } else {
-        (0..eval_scene.views.len()).collect()
+) -> Result<EvalSample<B>> {
+    // Compare MSE in RGB only.
+    let res = glam::uvec2(gt_img.width(), gt_img.height());
+
+    let gt_tensor = sample_to_tensor(&view_to_sample_image(gt_img.clone(), alpha_is_mask), device);
+
+    let gt_rgb = gt_tensor.slice(s![.., .., 0..3]);
+
+    // Render on reference black background.
+    let (img, aux) = {
+        let (img, aux) = B::render_splats(
+            gt_cam,
+            res,
+            splats.means.val().into_primitive().tensor(),
+            splats.log_scales.val().into_primitive().tensor(),
+            splats.rotation.val().into_primitive().tensor(),
+            splats.sh_coeffs.val().into_primitive().tensor(),
+            splats.raw_opacity.val().into_primitive().tensor(),
+            Vec3::ZERO,
+            true,
+        );
+        (Tensor::from_primitive(TensorPrimitive::Float(img)), aux)
     };
+    let render_rgb = img.slice(s![.., .., 0..3]);
 
-    let eval_views: Vec<_> = indices
-        .into_iter()
-        .map(|i| eval_scene.views[i].clone())
-        .collect();
+    // Simulate an 8-bit roundtrip for fair comparison.
+    let render_rgb = (render_rgb * 255.0).round() / 255.0;
 
-    let mut ret = vec![];
+    let mse = (render_rgb.clone() - gt_rgb.clone()).powi_scalar(2).mean();
 
-    for view in eval_views {
-        // Compare MSE in RGB only, not sure if this should include alpha.
-        let ground_truth: DynamicImage = view.image.clone().to_rgb8().into();
-        let res = glam::uvec2(ground_truth.width(), ground_truth.height());
+    let psnr = mse.recip().log() * 10.0 / std::f32::consts::LN_10;
+    let ssim_measure = Ssim::new(11, 3, device);
+    let ssim = ssim_measure.ssim(render_rgb.clone(), gt_rgb).mean();
 
-        let gt_tensor = image_to_tensor::<B>(&ground_truth, device);
-        let (rendered, aux) = splats.render(&view.camera, res, false);
-
-        let render_rgb = rendered.slice([0..res.y as usize, 0..res.x as usize, 0..3]);
-        let mse = (render_rgb.clone() - gt_tensor.clone())
-            .powf_scalar(2.0)
-            .mean();
-
-        let psnr = mse.recip().log() * 10.0 / std::f32::consts::LN_10;
-        let psnr = psnr.into_scalar_async().await.elem::<f32>();
-
-        let ssim_measure = Ssim::new(11, 3, device);
-        let ssim = ssim_measure.ssim(render_rgb.clone().unsqueeze(), gt_tensor.unsqueeze());
-        let ssim = ssim.into_scalar_async().await.elem::<f32>();
-
-        ret.push(EvalView {
-            view,
-            psnr,
-            ssim,
-            rendered: render_rgb,
-            aux,
-        });
-    }
-
-    EvalStats { samples: ret }
+    Ok(EvalSample {
+        gt_img,
+        psnr,
+        ssim,
+        rendered: render_rgb,
+        aux,
+    })
 }

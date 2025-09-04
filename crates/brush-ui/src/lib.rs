@@ -1,57 +1,62 @@
-use std::sync::Arc;
+#![recursion_limit = "256"]
 
-use burn_wgpu::{RuntimeOptions, WgpuDevice};
-use eframe::egui_wgpu::WgpuConfiguration;
-use wgpu::{Adapter, Device, Queue};
-
+pub mod app;
 pub mod burn_texture;
+pub mod camera_controls;
 
-pub fn create_wgpu_device(
-    adapter: Arc<Adapter>,
-    device: Arc<Device>,
-    queue: Arc<Queue>,
-) -> WgpuDevice {
-    let setup = burn_wgpu::WgpuSetup {
-        instance: Arc::new(wgpu::Instance::new(wgpu::InstanceDescriptor::default())), // unused... need to fix this in Burn.
-        adapter: adapter.clone(),
-        device: device.clone(),
-        queue: queue.clone(),
-    };
+pub mod ui_process;
 
-    burn_wgpu::init_device(
-        setup,
-        RuntimeOptions {
-            tasks_max: 64,
-            memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
-        },
-    )
+mod datasets;
+mod panels;
+mod scene;
+mod settings;
+mod stats;
+
+use eframe::egui_wgpu::WgpuConfiguration;
+use std::sync::Arc;
+use wasm_bindgen::prelude::*;
+use wgpu::{Adapter, Features};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[wasm_bindgen]
+pub enum UiMode {
+    // Default UI with data loading, stats view etc.
+    #[default]
+    Default,
+    // Show the splat fullscreen, but allow toggling, and control panels.
+    FullScreenSplat,
+    // Render as an embedded viewer which does nothing except render the splat.
+    EmbeddedViewer,
 }
 
 pub fn create_egui_options() -> WgpuConfiguration {
     WgpuConfiguration {
-        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew {
-            supported_backends: wgpu::Backends::all(),
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            device_descriptor: Arc::new(|adapter: &Adapter| wgpu::DeviceDescriptor {
-                label: Some("egui+burn"),
-                required_features: adapter.features(),
-                required_limits: adapter.limits(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            }),
-        },
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+            eframe::egui_wgpu::WgpuSetupCreateNew {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                device_descriptor: Arc::new(|adapter: &Adapter| wgpu::DeviceDescriptor {
+                    label: Some("egui+burn"),
+                    required_features: adapter
+                        .features()
+                        .difference(Features::MAPPABLE_PRIMARY_BUFFERS),
+                    required_limits: adapter.limits(),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::Off,
+                }),
+                ..Default::default()
+            },
+        ),
         ..Default::default()
     }
 }
 
-pub fn draw_checkerboard(ui: &mut egui::Ui, rect: egui::Rect) {
+pub fn draw_checkerboard(ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32) {
     let id = egui::Id::new("checkerboard");
     let handle = ui
         .ctx()
         .data(|data| data.get_temp::<egui::TextureHandle>(id));
 
-    let handle = if let Some(handle) = handle {
-        handle
-    } else {
+    let handle = handle.unwrap_or_else(|| {
         let color_1 = [190, 190, 190, 255];
         let color_2 = [240, 240, 240, 255];
 
@@ -74,13 +79,12 @@ pub fn draw_checkerboard(ui: &mut egui::Ui, rect: egui::Rect) {
             data.insert_temp(id, handle.clone());
         });
         handle
-    };
+    });
 
     let uv = egui::Rect::from_min_max(
         egui::pos2(0.0, 0.0),
         egui::pos2(rect.width() / 24.0, rect.height() / 24.0),
     );
 
-    ui.painter()
-        .image(handle.id(), rect, uv, egui::Color32::WHITE);
+    ui.painter().image(handle.id(), rect, uv, color);
 }

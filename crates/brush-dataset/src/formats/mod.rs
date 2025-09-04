@@ -1,45 +1,104 @@
-use crate::{
-    splat_import::{load_splat_from_ply, SplatMessage},
-    zip::DatasetZip,
-    Dataset, LoadDatasetArgs,
+use crate::{Dataset, config::LoadDataseConfig};
+use brush_serde::{DeserializeError, SplatMessage, load_splat_from_ply};
+use brush_vfs::BrushVfs;
+use burn::backend::wgpu::WgpuDevice;
+use path_clean::PathClean;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
 };
-use anyhow::Result;
-use brush_render::Backend;
-use std::{io::Cursor, pin::Pin};
-use tokio_stream::Stream;
 
 pub mod colmap;
 pub mod nerfstudio;
 
-// A dynamic stream of datasets
-type DataStream<T> = Pin<Box<dyn Stream<Item = Result<T>> + Send + 'static>>;
+use thiserror::Error;
 
-pub fn load_dataset<B: Backend>(
-    mut archive: DatasetZip,
-    load_args: &LoadDatasetArgs,
-    device: &B::Device,
-) -> anyhow::Result<(DataStream<SplatMessage<B>>, DataStream<Dataset>)> {
-    let streams = nerfstudio::read_dataset(archive.clone(), load_args, device)
-        .or_else(|_| colmap::load_dataset::<B>(archive.clone(), load_args, device));
+#[derive(Error, Debug)]
+pub enum FormatError {
+    #[error("IO error while loading dataset.")]
+    Io(#[from] std::io::Error),
 
-    let Ok(streams) = streams else {
-        anyhow::bail!("Couldn't parse dataset as any format. Only some formats are supported.")
+    #[error("Error decoding JSON file.")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Error decoding camera parameters: {0}")]
+    InvalidCamera(String),
+
+    #[error("Error when decoding format: {0}")]
+    InvalidFormat(String),
+
+    #[error("Error loading splat data: {0}")]
+    PlyError(#[from] DeserializeError),
+}
+
+#[derive(Debug, Error)]
+pub enum DatasetError {
+    #[error("Failed to load format.")]
+    FormatError(#[from] FormatError),
+
+    #[error("Failed to load initial point cloud.")]
+    InitialPointCloudError(#[from] DeserializeError),
+
+    #[error("Format not recognized: Only colmap and nerfstudio json are supported.")]
+    FormatNotSupported,
+}
+
+pub async fn load_dataset(
+    vfs: Arc<BrushVfs>,
+    load_args: &LoadDataseConfig,
+    device: &WgpuDevice,
+) -> Result<(Option<SplatMessage>, Dataset), DatasetError> {
+    let mut dataset = colmap::load_dataset(vfs.clone(), load_args, device).await;
+
+    if dataset.is_none() {
+        dataset = nerfstudio::read_dataset(vfs.clone(), load_args, device).await;
+    }
+
+    let Some(dataset) = dataset else {
+        return Err(DatasetError::FormatNotSupported);
     };
 
-    // If there's an init.ply definitey override the init stream with that.
-    let init_path = archive.find_with_extension(".ply", "init");
+    let (data_splat_init, dataset) = dataset?;
 
-    let init_stream = if let Ok(path) = init_path {
-        let ply_data = archive.read_bytes_at_path(&path)?;
-        log::info!("Using {path:?} as initial point cloud.");
-        Box::pin(load_splat_from_ply(
-            Cursor::new(ply_data),
-            load_args.subsample_points,
-            device.clone(),
-        ))
+    // If there's an initial ply file, override the init stream with that.
+    let ply_paths: Vec<_> = vfs.files_with_extension("ply").collect();
+
+    let main_ply_path = if ply_paths.len() == 1 {
+        Some(ply_paths.first().expect("unreachable"))
     } else {
-        streams.0
+        ply_paths.iter().find(|p| {
+            p.file_name()
+                .and_then(|p| p.to_str())
+                .is_some_and(|p| p == "init.ply")
+        })
     };
 
-    Ok((init_stream, streams.1))
+    let init_splat = if let Some(main_path) = main_ply_path {
+        log::info!("Using ply {main_path:?} as initial point cloud.");
+
+        let reader = vfs
+            .reader_at_path(main_path)
+            .await
+            .map_err(DeserializeError)?;
+        Some(load_splat_from_ply(reader, load_args.subsample_points, device.clone()).await?)
+    } else {
+        data_splat_init
+    };
+
+    Ok((init_splat, dataset))
+}
+
+fn find_mask_path(vfs: &BrushVfs, path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?.clean();
+    let file_stem = path.file_stem()?.to_str()?;
+    let masks_dir = parent.parent()?.join("masks").clean();
+    for candidate in vfs.files_with_stem(file_stem) {
+        let Some(file_parent) = candidate.parent() else {
+            continue;
+        };
+        if file_parent == masks_dir {
+            return Some(candidate);
+        }
+    }
+    None
 }

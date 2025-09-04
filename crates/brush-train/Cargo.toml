@@ -7,14 +7,30 @@ license.workspace = true
 
 [dependencies]
 brush-render.path = "../brush-render"
+brush-kernel.path = "../brush-kernel"
+brush-dataset.path = "../brush-dataset"
+brush-render-bwd.path = "../brush-render-bwd"
+
+
 anyhow.workspace = true
 image.workspace = true
+clap.workspace = true
 glam.workspace = true
 rand.workspace = true
 tracing.workspace = true
-parking_lot.workspace = true
 log.workspace = true
-tokio.workspace = true
+serde.workspace = true
+hashbrown.workspace = true
 
 burn.workspace = true
-burn-wgpu.workspace = true
+burn-cubecl.workspace = true
+burn-fusion.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+lpips.path = "../lpips"
+
+[lints]
+workspace = true
+
+[features]
+debug-validation = []

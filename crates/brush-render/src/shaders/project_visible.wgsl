@@ -1,6 +1,13 @@
+#define UNIFORM_WRITE
+
 #import helpers;
 
-@group(0) @binding(0) var<storage, read> uniforms: helpers::RenderUniforms;
+struct IsectInfo {
+    compact_gid: u32,
+    tile_id: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> uniforms: helpers::RenderUniforms;
 
 @group(0) @binding(1) var<storage, read> means: array<helpers::PackedVec3>;
 @group(0) @binding(2) var<storage, read> log_scales: array<helpers::PackedVec3>;
@@ -8,10 +15,9 @@
 @group(0) @binding(4) var<storage, read> coeffs: array<helpers::PackedVec3>;
 @group(0) @binding(5) var<storage, read> raw_opacities: array<f32>;
 
-@group(0) @binding(6) var<storage, read_write> global_from_compact_gid: array<u32>;
+@group(0) @binding(6) var<storage, read> global_from_compact_gid: array<u32>;
 
 @group(0) @binding(7) var<storage, read_write> projected: array<helpers::ProjectedSplat>;
-@group(0) @binding(8) var<storage, read_write> num_tiles_hit: array<u32>;
 
 struct ShCoeffs {
     b0_c0: vec3f,
@@ -45,6 +51,8 @@ struct ShCoeffs {
     b4_c8: vec3f,
 }
 
+const SH_C0: f32 = 0.2820947917738781f;
+
 // Evaluate spherical harmonics bases at unit direction for high orders using approach described by
 // Efficient Spherical Harmonic Evaluation, Peter-Pike Sloan, JCGT 2013
 // See https://jcgt.org/published/0002/02/06/ for reference implementation
@@ -53,7 +61,7 @@ fn sh_coeffs_to_color(
     viewdir: vec3f,
     sh: ShCoeffs,
 ) -> vec3f {
-    var colors = 0.2820947917738781f * sh.b0_c0;
+    var colors = SH_C0 * sh.b0_c0;
 
     if (degree == 0) {
         return colors;
@@ -146,10 +154,6 @@ fn sh_coeffs_to_color(
     return colors;
 }
 
-fn sigmoid(x: f32) -> f32 {
-    return 1.0 / (1.0 + exp(-x));
-}
-
 fn num_sh_coeffs(degree: u32) -> u32 {
     return (degree + 1) * (degree + 1);
 }
@@ -161,7 +165,7 @@ fn read_coeffs(base_id: ptr<function, u32>) -> vec3f {
 }
 
 @compute
-@workgroup_size(helpers::MAIN_WG, 1, 1)
+@workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let compact_gid = gid.x;
 
@@ -174,8 +178,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // Project world space to camera space.
     let mean = helpers::as_vec(means[global_gid]);
     let scale = exp(helpers::as_vec(log_scales[global_gid]));
-    let quat = quats[global_gid];
-    let opac = sigmoid(raw_opacities[global_gid]);
+    // Safe to normalize, splats with length(quat) == 0 are invisible.
+    let quat = normalize(quats[global_gid]);
+    let opac = helpers::sigmoid(raw_opacities[global_gid]);
 
     let viewmat = uniforms.viewmat;
     let R = mat3x3f(viewmat[0].xyz, viewmat[1].xyz, viewmat[2].xyz);
@@ -183,7 +188,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     let covar = helpers::calc_cov3d(scale, quat);
     let cov2d = helpers::calc_cov2d(covar, mean_c, uniforms.focal, uniforms.img_size, uniforms.pixel_center, viewmat);
-    let conic = helpers::inverse_symmetric(cov2d);
+    let conic = helpers::inverse(cov2d);
 
     // compute the projected mean
     let rz = 1.0 / mean_c.z;
@@ -191,7 +196,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     let sh_degree = uniforms.sh_degree;
     let num_coeffs = num_sh_coeffs(sh_degree);
-    var base_id = global_gid * num_coeffs;
+    var base_id = u32(global_gid) * num_coeffs;
 
     var sh = ShCoeffs();
     sh.b0_c0 = read_coeffs(&base_id);
@@ -232,30 +237,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         }
     }
 
+    // Write projected splat information.
     let viewdir = normalize(mean - uniforms.camera_position.xyz);
-
     var color = sh_coeffs_to_color(sh_degree, viewdir, sh) + vec3f(0.5);
-    // color = max(color, vec3f(0.0));
-
-    let radius = helpers::radius_from_cov(cov2d, opac);
-
-    let tile_minmax = helpers::get_tile_bbox(mean2d, radius, uniforms.tile_bounds);
-    let tile_min = tile_minmax.xy;
-    let tile_max = tile_minmax.zw;
-    var tile_area = 0u;
-
-    for (var ty = tile_min.y; ty < tile_max.y; ty++) {
-        for (var tx = tile_min.x; tx < tile_max.x; tx++) {
-            if helpers::can_be_visible(vec2u(tx, ty), mean2d, conic, opac) {
-                tile_area += 1u;
-            }
-        }
-    }
 
     projected[compact_gid] = helpers::create_projected_splat(
         mean2d,
-        conic,
+        vec3f(conic[0][0], conic[0][1], conic[1][1]),
         vec4f(color, opac)
     );
-    num_tiles_hit[compact_gid] = u32(tile_area);
 }

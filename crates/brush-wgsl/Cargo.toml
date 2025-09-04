@@ -7,9 +7,13 @@ license.workspace = true
 
 [dependencies]
 naga_oil.workspace = true
-naga.workspace = true
 anyhow.workspace = true
-regex = "1.10.4"
-regex-syntax = "0.8.3"
+regex = "1.11.1"
+regex-syntax = "0.8.5"
 data-encoding = "2.6.0"
+pathdiff = "0.2.3"
 thiserror.workspace = true
+wgpu.workspace = true
+
+[lints]
+workspace = true

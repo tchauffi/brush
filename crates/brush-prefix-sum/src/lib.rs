@@ -3,6 +3,8 @@ mod shaders;
 use brush_kernel::calc_cube_count;
 use brush_kernel::create_tensor;
 use brush_kernel::kernel_source_gen;
+use burn::tensor::DType;
+use burn_cubecl::cubecl::server::Bindings;
 use burn_wgpu::WgpuRuntime;
 use shaders::prefix_sum_add_scanned_sums;
 use shaders::prefix_sum_scan;
@@ -12,19 +14,23 @@ kernel_source_gen!(PrefixSumScan {}, prefix_sum_scan);
 kernel_source_gen!(PrefixSumScanSums {}, prefix_sum_scan_sums);
 kernel_source_gen!(PrefixSumAddScannedSums {}, prefix_sum_add_scanned_sums);
 
-use burn_wgpu::JitTensor;
+use burn_wgpu::CubeTensor;
 
-pub fn prefix_sum(input: JitTensor<WgpuRuntime, i32>) -> JitTensor<WgpuRuntime, i32> {
+pub fn prefix_sum(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRuntime> {
     let threads_per_group = shaders::prefix_sum_helpers::THREADS_PER_GROUP as usize;
     let num = input.shape.dims[0];
     let client = &input.client;
-    let outputs = create_tensor(input.shape.dims::<1>(), &input.device, client);
+    let outputs = create_tensor(input.shape.dims::<1>(), &input.device, DType::I32);
 
+    // SAFETY: Kernel has to contain no OOB indexing, bounded loops.
     unsafe {
         client.execute_unchecked(
             PrefixSumScan::task(),
             calc_cube_count([num as u32], PrefixSumScan::WORKGROUP_SIZE),
-            vec![input.handle.binding(), outputs.handle.clone().binding()],
+            Bindings::new().with_buffers(vec![
+                input.handle.binding(),
+                outputs.handle.clone().binding(),
+            ]),
         );
     }
 
@@ -37,34 +43,32 @@ pub fn prefix_sum(input: JitTensor<WgpuRuntime, i32>) -> JitTensor<WgpuRuntime, 
     let mut work_sz = num;
     while work_sz > threads_per_group {
         work_sz = work_sz.div_ceil(threads_per_group);
-        group_buffer.push(create_tensor::<u32, 1, WgpuRuntime>(
-            [work_sz],
-            &input.device,
-            client,
-        ));
+        group_buffer.push(create_tensor([work_sz], &input.device, DType::I32));
         work_size.push(work_sz);
     }
 
+    // SAFETY: Kernel has to contain no OOB indexing, bounded loops.
     unsafe {
         client.execute_unchecked(
             PrefixSumScanSums::task(),
             calc_cube_count([work_size[0] as u32], PrefixSumScanSums::WORKGROUP_SIZE),
-            vec![
+            Bindings::new().with_buffers(vec![
                 outputs.handle.clone().binding(),
                 group_buffer[0].handle.clone().binding(),
-            ],
+            ]),
         );
     }
 
     for l in 0..(group_buffer.len() - 1) {
+        // SAFETY: Kernel has to contain no OOB indexing, bounded loops.
         unsafe {
             client.execute_unchecked(
                 PrefixSumScanSums::task(),
                 calc_cube_count([work_size[l + 1] as u32], PrefixSumScanSums::WORKGROUP_SIZE),
-                vec![
+                Bindings::new().with_buffers(vec![
                     group_buffer[l].handle.clone().binding(),
                     group_buffer[l + 1].handle.clone().binding(),
-                ],
+                ]),
             );
         }
     }
@@ -72,18 +76,20 @@ pub fn prefix_sum(input: JitTensor<WgpuRuntime, i32>) -> JitTensor<WgpuRuntime, 
     for l in (1..group_buffer.len()).rev() {
         let work_sz = work_size[l - 1];
 
+        // SAFETY: Kernel has to contain no OOB indexing, bounded loops.
         unsafe {
             client.execute_unchecked(
                 PrefixSumAddScannedSums::task(),
                 calc_cube_count([work_sz as u32], PrefixSumAddScannedSums::WORKGROUP_SIZE),
-                vec![
+                Bindings::new().with_buffers(vec![
                     group_buffer[l].handle.clone().binding(),
                     group_buffer[l - 1].handle.clone().binding(),
-                ],
+                ]),
             );
         }
     }
 
+    // SAFETY: Kernel has to contain no OOB indexing, bounded loops.
     unsafe {
         client.execute_unchecked(
             PrefixSumAddScannedSums::task(),
@@ -91,10 +97,10 @@ pub fn prefix_sum(input: JitTensor<WgpuRuntime, i32>) -> JitTensor<WgpuRuntime, 
                 [(work_size[0] * threads_per_group) as u32],
                 PrefixSumAddScannedSums::WORKGROUP_SIZE,
             ),
-            vec![
+            Bindings::new().with_buffers(vec![
                 group_buffer[0].handle.clone().binding(),
                 outputs.handle.clone().binding(),
-            ],
+            ]),
         );
     }
 
@@ -105,18 +111,19 @@ pub fn prefix_sum(input: JitTensor<WgpuRuntime, i32>) -> JitTensor<WgpuRuntime, 
 mod tests {
     use crate::prefix_sum;
     use burn::tensor::{Int, Tensor};
-    use burn_wgpu::{JitBackend, WgpuRuntime};
+    use burn_wgpu::{CubeBackend, WgpuRuntime};
+
+    type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 
     #[test]
     fn test_sum_tiny() {
-        type Backend = JitBackend<WgpuRuntime, f32, i32>;
         let device = Default::default();
         let keys = Tensor::<Backend, 1, Int>::from_data([1, 1, 1, 1], &device).into_primitive();
-        let summed = prefix_sum(keys.clone());
+        let summed = prefix_sum(keys);
         let summed = Tensor::<Backend, 1, Int>::from_primitive(summed).to_data();
-        let summed = summed.as_slice::<i32>().unwrap();
+        let summed = summed.as_slice::<i32>().expect("Wrong type");
         assert_eq!(summed.len(), 4);
-        assert_eq!(summed, [1, 2, 3, 4])
+        assert_eq!(summed, [1, 2, 3, 4]);
     }
 
     #[test]
@@ -126,10 +133,9 @@ mod tests {
         for i in 0..ITERS {
             data.push(90 + i as i32);
         }
-        type Backend = JitBackend<WgpuRuntime, f32, i32>;
         let device = Default::default();
         let keys = Tensor::<Backend, 1, Int>::from_data(data.as_slice(), &device).into_primitive();
-        let summed = prefix_sum(keys.clone());
+        let summed = prefix_sum(keys);
         let summed = Tensor::<Backend, 1, Int>::from_primitive(summed).to_data();
         let prefix_sum_ref: Vec<_> = data
             .into_iter()
@@ -138,8 +144,13 @@ mod tests {
                 Some(*x)
             })
             .collect();
-        for (summed, reff) in summed.as_slice::<i32>().unwrap().iter().zip(prefix_sum_ref) {
-            assert_eq!(*summed, reff)
+        for (summed, reff) in summed
+            .as_slice::<i32>()
+            .expect("Wrong type")
+            .iter()
+            .zip(prefix_sum_ref)
+        {
+            assert_eq!(*summed, reff);
         }
     }
 
@@ -155,10 +166,9 @@ mod tests {
             data.push(30965);
         }
 
-        type Backend = JitBackend<WgpuRuntime, f32, i32>;
         let device = Default::default();
         let keys = Tensor::<Backend, 1, Int>::from_data(data.as_slice(), &device).into_primitive();
-        let summed = prefix_sum(keys.clone());
+        let summed = prefix_sum(keys);
         let summed = Tensor::<Backend, 1, Int>::from_primitive(summed).to_data();
 
         let prefix_sum_ref: Vec<_> = data
@@ -169,8 +179,13 @@ mod tests {
             })
             .collect();
 
-        for (summed, reff) in summed.as_slice::<i32>().unwrap().iter().zip(prefix_sum_ref) {
-            assert_eq!(*summed, reff)
+        for (summed, reff) in summed
+            .as_slice::<i32>()
+            .expect("Wrong type")
+            .iter()
+            .zip(prefix_sum_ref)
+        {
+            assert_eq!(*summed, reff);
         }
     }
 }

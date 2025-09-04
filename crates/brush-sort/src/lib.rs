@@ -1,12 +1,14 @@
+use brush_kernel::CubeCount;
 use brush_kernel::create_dispatch_buffer;
 use brush_kernel::create_tensor;
 use brush_kernel::create_uniform_buffer;
-use brush_kernel::CubeCount;
+use burn::tensor::DType;
 use burn::tensor::Int;
 use burn::tensor::Tensor;
-use burn_jit::JitBackend;
-use burn_jit::JitElement;
-use burn_wgpu::JitTensor;
+use burn::tensor::TensorMetadata;
+use burn_cubecl::CubeBackend;
+use burn_cubecl::cubecl::server::Bindings;
+use burn_wgpu::CubeTensor;
 use burn_wgpu::WgpuRuntime;
 use shaders::sort_count;
 use shaders::sort_reduce;
@@ -29,14 +31,18 @@ kernel_source_gen!(SortScanAdd {}, sort_scan_add);
 kernel_source_gen!(SortScan {}, sort_scan);
 kernel_source_gen!(SortScatter {}, sort_scatter);
 
-pub fn radix_argsort<EKey: JitElement, EVal: JitElement>(
-    input_keys: JitTensor<WgpuRuntime, EKey>,
-    input_values: JitTensor<WgpuRuntime, EVal>,
-    n_sort: JitTensor<WgpuRuntime, i32>,
+pub fn radix_argsort(
+    input_keys: CubeTensor<WgpuRuntime>,
+    input_values: CubeTensor<WgpuRuntime>,
+    n_sort: &CubeTensor<WgpuRuntime>,
     sorting_bits: u32,
-) -> (JitTensor<WgpuRuntime, EKey>, JitTensor<WgpuRuntime, EVal>) {
-    assert_eq!(input_keys.shape.dims[0], input_values.shape.dims[0]);
-    assert!(sorting_bits <= 32);
+) -> (CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>) {
+    assert_eq!(
+        input_keys.shape.dims[0], input_values.shape.dims[0],
+        "Input keys and values must have the same number of elements"
+    );
+    assert_eq!(n_sort.shape.dims[0], 1, "Sort count must have one element");
+    assert!(sorting_bits <= 32, "Can only sort up to 32 bits");
 
     let _span = tracing::trace_span!("Radix sort").entered();
 
@@ -49,96 +55,87 @@ pub fn radix_argsort<EKey: JitElement, EVal: JitElement>(
     let max_needed_wgs = max_n.div_ceil(BLOCK_SIZE);
 
     let num_wgs = create_dispatch_buffer(n_sort.clone(), [BLOCK_SIZE, 1, 1]);
-    let num_reduce_wgs: Tensor<JitBackend<WgpuRuntime, f32, i32>, 1, Int> =
+    let num_reduce_wgs: Tensor<CubeBackend<WgpuRuntime, f32, i32, u32>, 1, Int> =
         Tensor::from_primitive(create_dispatch_buffer(num_wgs.clone(), [BLOCK_SIZE, 1, 1]))
             * Tensor::from_ints([BIN_COUNT, 1, 1], device);
-    let num_reduce_wgs: JitTensor<WgpuRuntime, i32> = num_reduce_wgs.into_primitive();
+    let num_reduce_wgs: CubeTensor<WgpuRuntime> = num_reduce_wgs.into_primitive();
 
     let mut cur_keys = input_keys;
     let mut cur_vals = input_values;
 
     for pass in 0..sorting_bits.div_ceil(4) {
-        let uniforms_buffer: JitTensor<WgpuRuntime, i32> = create_uniform_buffer(
+        let uniforms_buffer: CubeTensor<WgpuRuntime> = create_uniform_buffer(
             shaders::sort_count::Uniforms { shift: pass * 4 },
             device,
             client,
         );
 
-        let count_buf =
-            create_tensor::<i32, 1, WgpuRuntime>([(max_needed_wgs as usize) * 16], device, client);
+        let count_buf = create_tensor([(max_needed_wgs as usize) * 16], device, DType::I32);
 
-        // SAFETY: wgsl FFI, kernel checked to have no OOB.
-        unsafe {
-            client.execute_unchecked(
-                SortCount::task(),
-                CubeCount::Dynamic(num_wgs.clone().handle.binding()),
-                vec![
-                    uniforms_buffer.clone().handle.binding(),
-                    n_sort.clone().handle.binding(),
-                    cur_keys.handle.clone().binding(),
-                    count_buf.clone().handle.binding(),
-                ],
-            );
-        }
+        // use safe distpatch as dynamic work count isn't verified.
+        client.execute(
+            SortCount::task(),
+            CubeCount::Dynamic(num_wgs.clone().handle.binding()),
+            Bindings::new().with_buffers(vec![
+                uniforms_buffer.handle.clone().binding(),
+                n_sort.handle.clone().binding(),
+                cur_keys.handle.clone().binding(),
+                count_buf.handle.clone().binding(),
+            ]),
+        );
 
         {
-            let reduced_buf =
-                create_tensor::<i32, 1, WgpuRuntime>([BLOCK_SIZE as usize], device, client);
+            let reduced_buf = create_tensor([BLOCK_SIZE as usize], device, DType::I32);
 
-            unsafe {
-                client.execute_unchecked(
-                    SortReduce::task(),
-                    CubeCount::Dynamic(num_reduce_wgs.clone().handle.binding()),
-                    vec![
-                        n_sort.clone().handle.binding(),
-                        count_buf.clone().handle.binding(),
-                        reduced_buf.clone().handle.binding(),
-                    ],
-                );
-            }
+            client.execute(
+                SortReduce::task(),
+                CubeCount::Dynamic(num_reduce_wgs.handle.clone().binding()),
+                Bindings::new().with_buffers(vec![
+                    n_sort.handle.clone().binding(),
+                    count_buf.handle.clone().binding(),
+                    reduced_buf.handle.clone().binding(),
+                ]),
+            );
 
+            // SAFETY: No OOB or loops in kernel.
             unsafe {
                 client.execute_unchecked(
                     SortScan::task(),
                     CubeCount::Static(1, 1, 1),
-                    vec![
-                        n_sort.clone().handle.binding(),
-                        reduced_buf.clone().handle.binding(),
-                    ],
+                    Bindings::new().with_buffers(vec![
+                        n_sort.handle.clone().binding(),
+                        reduced_buf.handle.clone().binding(),
+                    ]),
                 );
             }
 
-            unsafe {
-                client.execute_unchecked(
-                    SortScanAdd::task(),
-                    CubeCount::Dynamic(num_reduce_wgs.handle.clone().binding()),
-                    vec![
-                        n_sort.clone().handle.binding(),
-                        reduced_buf.clone().handle.binding(),
-                        count_buf.clone().handle.binding(),
-                    ],
-                );
-            }
-        }
-
-        let output_keys = create_tensor::<EKey, 1, _>([max_n as usize], device, client);
-        let output_values = create_tensor::<EVal, 1, _>([max_n as usize], device, client);
-
-        unsafe {
-            client.execute_unchecked(
-                SortScatter::task(),
-                CubeCount::Dynamic(num_wgs.clone().handle.binding()),
-                vec![
-                    uniforms_buffer.handle.clone().binding(),
-                    n_sort.clone().handle.binding(),
-                    cur_keys.handle.clone().binding(),
-                    cur_vals.handle.clone().binding(),
+            client.execute(
+                SortScanAdd::task(),
+                CubeCount::Dynamic(num_reduce_wgs.handle.clone().binding()),
+                Bindings::new().with_buffers(vec![
+                    n_sort.handle.clone().binding(),
+                    reduced_buf.handle.clone().binding(),
                     count_buf.handle.clone().binding(),
-                    output_keys.handle.clone().binding(),
-                    output_values.handle.clone().binding(),
-                ],
+                ]),
             );
         }
+
+        let output_keys = create_tensor([max_n as usize], device, cur_keys.dtype());
+        let output_values = create_tensor([max_n as usize], device, cur_vals.dtype());
+
+        client.execute(
+            SortScatter::task(),
+            CubeCount::Dynamic(num_wgs.handle.clone().binding()),
+            Bindings::new().with_buffers(vec![
+                uniforms_buffer.handle.clone().binding(),
+                n_sort.handle.clone().binding(),
+                cur_keys.handle.clone().binding(),
+                cur_vals.handle.clone().binding(),
+                count_buf.handle.clone().binding(),
+                output_keys.handle.clone().binding(),
+                output_values.handle.clone().binding(),
+            ]),
+        );
 
         cur_keys = output_keys;
         cur_vals = output_values;
@@ -150,10 +147,10 @@ pub fn radix_argsort<EKey: JitElement, EVal: JitElement>(
 mod tests {
     use crate::radix_argsort;
     use burn::tensor::{Int, Tensor};
-    use burn_wgpu::{JitBackend, WgpuRuntime};
+    use burn_wgpu::{CubeBackend, WgpuRuntime};
     use rand::Rng;
 
-    type Backend = JitBackend<WgpuRuntime, f32, i32>;
+    type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 
     pub fn argsort<T: Ord>(data: &[T]) -> Vec<usize> {
         let mut indices = (0..data.len()).collect::<Vec<_>>();
@@ -191,7 +188,7 @@ mod tests {
                 .into_primitive();
             let num_points = Tensor::<Backend, 1, Int>::from_ints([keys_inp.len() as i32], &device)
                 .into_primitive();
-            let (ret_keys, ret_values) = radix_argsort(keys, values, num_points, 32);
+            let (ret_keys, ret_values) = radix_argsort(keys, values, &num_points, 32);
 
             let ret_keys = Tensor::<Backend, 1, Int>::from_primitive(ret_keys).into_data();
 
@@ -204,9 +201,9 @@ mod tests {
 
             for (((key, val), ref_key), ref_val) in ret_keys
                 .as_slice::<i32>()
-                .unwrap()
+                .expect("Wrong type")
                 .iter()
-                .zip(ret_values.as_slice::<i32>().unwrap())
+                .zip(ret_values.as_slice::<i32>().expect("Wrong type"))
                 .zip(ref_keys)
                 .zip(ref_values)
             {
@@ -219,14 +216,14 @@ mod tests {
     #[test]
     fn test_sorting_big() {
         // Simulate some data as one might find for a bunch of gaussians.
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut keys_inp = Vec::new();
         for i in 0..10000 {
-            let start = rng.gen_range(i..i + 150);
-            let end = rng.gen_range(start..start + 250);
+            let start = rng.random_range(i..i + 150);
+            let end = rng.random_range(start..start + 250);
 
             for j in start..end {
-                if rng.gen::<f32>() < 0.5 {
+                if rng.random::<f32>() < 0.5 {
                     keys_inp.push(j);
                 }
             }
@@ -242,7 +239,7 @@ mod tests {
         let num_points =
             Tensor::<Backend, 1, Int>::from_ints([keys_inp.len() as i32], &device).into_primitive();
 
-        let (ret_keys, ret_values) = radix_argsort(keys, values, num_points, 32);
+        let (ret_keys, ret_values) = radix_argsort(keys, values, &num_points, 32);
 
         let ret_keys = Tensor::<Backend, 1, Int>::from_primitive(ret_keys).to_data();
         let ret_values = Tensor::<Backend, 1, Int>::from_primitive(ret_values).to_data();
@@ -253,9 +250,9 @@ mod tests {
 
         for (((key, val), ref_key), ref_val) in ret_keys
             .as_slice::<i32>()
-            .unwrap()
+            .expect("Wrong type")
             .iter()
-            .zip(ret_values.as_slice::<i32>().unwrap())
+            .zip(ret_values.as_slice::<i32>().expect("Wrong type"))
             .zip(ref_keys)
             .zip(ref_values)
         {

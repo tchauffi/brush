@@ -7,4 +7,7 @@ license.workspace = true
 
 [dependencies]
 glam.workspace = true
-byteorder.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+
+[lints]
+workspace = true
